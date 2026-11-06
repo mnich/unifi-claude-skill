@@ -31,6 +31,30 @@ Add `--json` for compact output when piping or parsing. Default output is pretty
 
 ---
 
+## Secrets — never leak them
+
+The controller API returns credentials in plain text: WiFi passphrases, SSH, RADIUS and
+PPPoE passwords, VPN and TLS private keys, API tokens (mostly fields prefixed `x_`, plus
+`utm_token`, `*password*`, `*private_key*`, PEM blobs). The script masks all of them as
+`"<redacted>"` in its output by default.
+
+Rules:
+
+- **Never pass `--show-secrets`** unless the user explicitly asks to see a specific secret,
+  and then show only that one value — not the whole object.
+- **Never bypass the script to read raw API responses** (`curl`, ad-hoc `urllib`, reading
+  the controller response another way): that skips redaction.
+- **Never write unredacted API responses to files** (scratch dumps, logs, reports, commits).
+- When summarising or auditing config, report a secret's *properties* (set/unset, length,
+  WPA mode), never its value.
+- Updates still work with masked data: fetch the object, change what you need, PUT it back
+  with the `"<redacted>"` placeholders left in place — the script restores the real values
+  from the controller before sending. A POST (create) containing `"<redacted>"` is refused;
+  supply real values there only if the user provides them.
+- If a secret did end up in the conversation anyway, say so and recommend rotating it.
+
+---
+
 ## Command reference
 
 ### Status & health

@@ -11,8 +11,11 @@ the .env file. Supported keys:
 Usage: python udm.py <command> [subcommand] [args] [--json]
 
 Global flags:
-  --json       Output raw JSON (default: pretty-printed)
-  --host HOST  Override host (default: $UDM_HOST or unifi.local)
+  --json          Output raw JSON (default: pretty-printed)
+  --host HOST     Override host (default: $UDM_HOST or unifi.local)
+  --show-secrets  Do not mask secrets in output (passwords, keys, tokens).
+                  By default they are printed as "<redacted>"; updates that send
+                  "<redacted>" back get the real values restored automatically.
 """
 
 import argparse
@@ -57,6 +60,84 @@ DEFAULT_HOST = os.environ.get("UDM_HOST", "unifi.local")
 DEFAULT_SITE = "default"
 
 
+# ── Secret redaction ──────────────────────────────────────────────────────────
+# API responses contain credentials (WiFi passphrases, SSH/RADIUS/PPPoE
+# passwords, VPN private keys, TLS private keys, API tokens). They are masked in
+# every output by default so they never end up in terminal scrollback, logs or
+# an AI assistant's context. Writes transparently restore masked values from the
+# controller, so the fetch → modify → PUT workflow keeps working.
+
+REDACTED = "<redacted>"
+_SECRET_KEYS = {
+    "utm_token", "password", "passphrase", "psk", "secret", "token",
+    "private_key", "server_certificate_key", "pre_shared_key", "shared_secret",
+}
+_SECRET_SUBSTRINGS = ("password", "passphrase", "private_key", "secret", "psk", "token")
+_PEM_PRIVATE_B64 = "LS0tLS1CRUdJTi"  # base64 of "-----BEGIN"
+
+
+def _is_secret_key(key: str) -> bool:
+    k = key.lower()
+    return k.startswith("x_") or k in _SECRET_KEYS or any(s in k for s in _SECRET_SUBSTRINGS)
+
+
+def _contains_private_key(value: str) -> bool:
+    if "PRIVATE KEY" in value:
+        return True
+    if value.startswith(_PEM_PRIVATE_B64) and len(value) > 200:
+        import base64
+        try:
+            return b"PRIVATE KEY" in base64.b64decode(value, validate=False)
+        except Exception:
+            return True  # undecodable PEM-looking blob — err on the safe side
+    return False
+
+
+def redact(data: Any) -> Any:
+    """Return a copy of data with secret values replaced by REDACTED."""
+    if isinstance(data, dict):
+        out = {}
+        for k, v in data.items():
+            if _is_secret_key(str(k)) and v not in (None, "", [], {}) and not isinstance(v, bool):
+                out[k] = REDACTED
+            else:
+                out[k] = redact(v)
+        return out
+    if isinstance(data, list):
+        return [redact(v) for v in data]
+    if isinstance(data, str) and _contains_private_key(data):
+        return REDACTED
+    return data
+
+
+def _has_redacted(data: Any) -> bool:
+    if data == REDACTED:
+        return True
+    if isinstance(data, dict):
+        return any(_has_redacted(v) for v in data.values())
+    if isinstance(data, list):
+        return any(_has_redacted(v) for v in data)
+    return False
+
+
+_MISSING = object()
+
+
+def _restore(new: Any, old: Any) -> Any:
+    """Replace REDACTED placeholders in new with the value at the same path in old."""
+    if new == REDACTED:
+        if old is _MISSING:
+            raise ValueError("no original value to restore a redacted field from")
+        return old
+    if isinstance(new, dict):
+        return {k: _restore(v, old.get(k, _MISSING) if isinstance(old, dict) else _MISSING)
+                for k, v in new.items()}
+    if isinstance(new, list):
+        return [_restore(v, old[i] if isinstance(old, list) and i < len(old) else _MISSING)
+                for i, v in enumerate(new)]
+    return new
+
+
 def get_api_key() -> str:
     env_key = os.environ.get("UNIFI_API_KEY")
     if env_key:
@@ -90,8 +171,34 @@ class UDMClient:
     def _integration(self, path: str) -> str:
         return f"{self.base}/proxy/network/integration/v1/{path}"
 
+    def _restore_redacted(self, method: str, url: str, body: Any) -> Any:
+        """Swap REDACTED placeholders in a write body for the controller's current values."""
+        if method != "PUT":
+            print(f"Refusing {method}: body contains {REDACTED} placeholders "
+                  "(only PUT updates of existing objects can restore them)", file=sys.stderr)
+            sys.exit(1)
+        # Legacy settings are written via set/setting/<key>[/<id>] but read via get/setting/<key>
+        get_url = url
+        if "/set/setting/" in url:
+            prefix, _, rest = url.partition("/set/setting/")
+            get_url = f"{prefix}/get/setting/{rest.split('/')[0]}"
+        current = self._request("GET", get_url, redact_guard=False)
+        if isinstance(current, list):
+            obj_id = body.get("_id") if isinstance(body, dict) else None
+            match = [o for o in current if isinstance(o, dict) and o.get("_id") == obj_id]
+            if not match and len(current) == 1:
+                match = current
+            current = match[0] if match else _MISSING
+        try:
+            return _restore(body, current)
+        except ValueError as e:
+            print(f"Refusing {method} {url}: {e}", file=sys.stderr)
+            sys.exit(1)
+
     def _request(self, method: str, url: str, body: dict | None = None,
-                 unwrap: bool = True) -> Any:
+                 unwrap: bool = True, redact_guard: bool = True) -> Any:
+        if redact_guard and body is not None and _has_redacted(body):
+            body = self._restore_redacted(method, url, body)
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, headers=self.headers, method=method)
         try:
@@ -330,7 +437,12 @@ class UDMClient:
         return self._request(method.upper(), url, body)
 
 
+SHOW_SECRETS = False
+
+
 def output(data: Any, as_json: bool = False) -> None:
+    if not SHOW_SECRETS:
+        data = redact(data)
     if as_json:
         print(json.dumps(data))
     else:
@@ -343,6 +455,11 @@ def main() -> None:
     as_json = "--json" in argv
     if as_json:
         argv.remove("--json")
+
+    global SHOW_SECRETS
+    if "--show-secrets" in argv:
+        argv.remove("--show-secrets")
+        SHOW_SECRETS = True
 
     override_host = DEFAULT_HOST
     if "--host" in argv:
