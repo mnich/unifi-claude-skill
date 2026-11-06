@@ -81,6 +81,15 @@ python ~/.claude/skills/unifi/scripts/udm.py clients
 python ~/.claude/skills/unifi/scripts/udm.py --help
 ```
 
+## Secrets are masked by default
+
+The UniFi API returns credentials in plain text (WiFi passphrases, SSH/RADIUS/PPPoE
+passwords, VPN and TLS private keys, API tokens). `udm.py` replaces them with
+`"<redacted>"` in all output, so they don't end up in your terminal history or in
+Claude's context. Updates still work: when you PUT an object back with
+`"<redacted>"` placeholders, the script restores the real values from the controller
+before sending. To see the raw values, pass `--show-secrets`.
+
 ## Structure
 
 ```
