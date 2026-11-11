@@ -107,6 +107,34 @@ refused). Pass `--show-secrets` to see raw values.
 The helper also works on its own — see `udm.py --help` and
 [references/commands.md](references/commands.md).
 
+## Alerts (push / email)
+
+`scripts/monitor.py` is a small read-only monitor for an always-on host (homelab, NAS,
+Raspberry Pi). Run every few minutes, it reports each change once when it starts and
+once when it clears:
+
+- internet down / back, UniFi devices offline / online, site-to-site VPN tunnels
+- gateway CPU temperature outside `MONITOR_TEMP_MIN`..`MONITOR_TEMP_MAX`
+- new IPS threats and honeypot hits, admin logins from IPs not in `MONITOR_ADMIN_IPS`
+- clients that were never seen on the network before
+
+The first run only saves a baseline. Delivery: push through [ntfy](https://ntfy.sh)
+(`NTFY_URL`, install the ntfy app and subscribe to the same topic) and/or email through a local MTA (`SENDMAIL_CMD="msmtp -t"`) or SMTP
+(`SMTP_*`; both need `MAIL_TO`) — see `.env.example`. Do not give it your admin API key: a key
+always carries the full rights of the admin who created it, and View Only admins cannot
+create keys. Instead create a local admin with the **View Only** role for UniFi Network
+and set `UNIFI_USERNAME` / `UNIFI_PASSWORD`; the monitor logs in like the web UI and
+reuses the session (stored with mode 600 in its state file).
+
+```bash
+python3 scripts/monitor.py --test       # send a test notification
+python3 scripts/monitor.py --dry-run    # print what would be sent
+# every 5 minutes with systemd (user units):
+mkdir -p ~/.config/systemd/user && cp contrib/systemd/udm-monitor.* ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now udm-monitor.timer
+sudo loginctl enable-linger "$USER"     # keep user timers running without a login
+```
+
 ## Layout
 
 ```
@@ -117,6 +145,7 @@ references/
   api-notes.md           # API layers, Network 10.x changes, quirks
 scripts/
   udm.py                 # entry point
+  monitor.py             # read-only alerting (ntfy push / email), for cron or systemd
   udmlib/
     config.py            # .env, settings, API key lookup
     client.py            # HTTP client: timeouts, error handling, --dry-run
@@ -125,6 +154,7 @@ scripts/
     secrets.py           # masks secrets in output, restores them on PUT
     commands/            # one module per area: clients, devices, network, firewall,
                          # logs, stats, guests, system
+contrib/systemd/         # udm-monitor.service + .timer (every 5 minutes)
 tests/                   # unit tests with a fake controller (no network needed)
 ```
 

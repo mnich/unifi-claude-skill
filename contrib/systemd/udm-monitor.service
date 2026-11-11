@@ -1,0 +1,14 @@
+[Unit]
+Description=UniFi read-only monitor (push/email alerts)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust the path to where the repository is cloned.
+ExecStart=/usr/bin/python3 %h/unifi-claude-skill/scripts/monitor.py
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state
