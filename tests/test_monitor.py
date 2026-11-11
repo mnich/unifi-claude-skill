@@ -67,5 +67,18 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(alerts, ["New device on the network"])
 
 
+    def test_daily_report(self):
+        fc = controller(cpu=90, events=[
+            {"timestamp": 86_400_000 + 5_000, "key": "THREAT_BLOCKED_V3", "severity": "HIGH",
+             "parameters": {"SRC_IP": "1.2.3.4", "DST_IP": "10.0.0.5"}}])
+        fc.on("GET", "stat/sta", [{"network": "LAN"}, {"network": "LAN"}, {"network": "IoT"}])
+        subject, body, problems = monitor.build_report(make_client(fc), now_ms=86_400_000 + 10_000)
+        self.assertEqual(problems, 1)
+        self.assertIn("1 problem(s)", subject)
+        self.assertIn("temperature 90", body)
+        self.assertIn("LAN: 2", body)
+        self.assertIn("IPS threats blocked: 1", body)
+
+
 if __name__ == "__main__":
     unittest.main()

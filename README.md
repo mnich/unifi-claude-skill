@@ -126,13 +126,27 @@ create keys. Instead create a local admin with the **View Only** role for UniFi 
 and set `UNIFI_USERNAME` / `UNIFI_PASSWORD`; the monitor logs in like the web UI and
 reuses the session (stored with mode 600 in its state file).
 
+`--report` emails a daily status report (internet, speed test, devices with
+temperatures and firmware, VPN, clients per network, new clients, last 24 h of IPS
+threats and admin logins) and pushes a one-line summary.
+
 ```bash
 python3 scripts/monitor.py --test       # send a test notification
+python3 scripts/monitor.py --report --dry-run   # print the daily report
 python3 scripts/monitor.py --dry-run    # print what would be sent
 # every 5 minutes with systemd (user units):
 mkdir -p ~/.config/systemd/user && cp contrib/systemd/udm-monitor.* ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now udm-monitor.timer
 sudo loginctl enable-linger "$USER"     # keep user timers running without a login
+```
+
+Or with cron (no sudo needed). Debian/Ubuntu cron uses the system time zone, so to send
+the report at 08:00 local time on a UTC host, run it at both candidate hours and let the
+job check the local hour:
+
+```cron
+* * * * * flock -n /tmp/udm-monitor.lock python3 $HOME/unifi-claude-skill/scripts/monitor.py >> $HOME/.local/state/udm-monitor.log 2>&1
+0 6,7 * * * [ "$(TZ=Europe/Warsaw date +\%H)" = 08 ] && TZ=Europe/Warsaw flock -w 120 /tmp/udm-monitor.lock python3 $HOME/unifi-claude-skill/scripts/monitor.py --report >> $HOME/.local/state/udm-monitor.log 2>&1
 ```
 
 ## Layout

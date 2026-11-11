@@ -32,6 +32,8 @@ Configuration (environment or the skill's .env):
 
 Usage:
   monitor.py            run all checks once
+  monitor.py --report   email a daily status report (internet, devices, temperatures,
+                        clients, last 24 h of security events); push gets a short summary
   monitor.py --test     send a test notification and exit
   monitor.py --dry-run  print alerts instead of sending them
 """
@@ -252,19 +254,137 @@ def make_client(settings: Settings, state: dict) -> UDMClient:
     return client
 
 
+# ── daily report ────────────────────────────────────────────────────────────
+
+def _dur(seconds: Any) -> str:
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError):
+        return "?"
+    d, s = divmod(s, 86400)
+    return f"{d}d {s // 3600}h" if d else f"{s // 3600}h {s % 3600 // 60}m"
+
+
+def build_report(c: UDMClient, now_ms: int) -> tuple[str, str, int]:
+    """Return (subject, body, number of problems) for the daily status email."""
+    problems: list[str] = []
+    out: list[str] = []
+    health = {h.get("subsystem"): h for h in c.get(c.legacy("stat/health"))}
+
+    wan, www = health.get("wan", {}), health.get("www", {})
+    out.append("INTERNET")
+    out.append(f"  status: WAN {wan.get('status')}, www {www.get('status')}, "
+               f"latency {www.get('latency', '?')} ms")
+    out.append(f"  WAN IP {wan.get('wan_ip', '?')} ({wan.get('isp_name', '?')})")
+    if www.get("speedtest_lastrun"):
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(www["speedtest_lastrun"]))
+        out.append(f"  last speed test {when}: {www.get('xput_down', '?')} / "
+                   f"{www.get('xput_up', '?')} Mbps, ping {www.get('speedtest_ping', '?')} ms")
+    if wan.get("status") != "ok" or www.get("status") != "ok":
+        problems.append("internet")
+
+    ignore = _csv("MONITOR_IGNORE_DEVICES")
+    tmin = float(os.environ.get("MONITOR_TEMP_MIN", "5"))
+    tmax = float(os.environ.get("MONITOR_TEMP_MAX", "75"))
+    out.append("\nDEVICES")
+    for d in c.get(c.legacy("stat/device")):
+        name = d.get("name") or d.get("model") or d.get("mac")
+        if d.get("state") != 1:
+            out.append(f"  {name}: OFFLINE")
+            if (d.get("mac") or "").lower() not in ignore:
+                problems.append(f"{name} offline")
+            continue
+        st = d.get("system-stats") or {}
+        line = (f"  {name}: online {_dur(d.get('uptime'))}, CPU {st.get('cpu', '?')}%, "
+                f"RAM {st.get('mem', '?')}%, fw {d.get('version', '?')}")
+        if d.get("upgradable"):
+            line += " (update available)"
+        out.append(line)
+        for t in d.get("temperatures") or []:
+            v = float(t.get("value") or 0)
+            flag = "  <-- out of range" if not tmin <= v <= tmax else ""
+            out.append(f"      {t.get('name')}: {v:.1f} °C{flag}")
+            if flag:
+                problems.append(f"{name} temperature {v:.0f} °C")
+
+    vpn = health.get("vpn", {})
+    if vpn.get("site_to_site_enabled") or vpn.get("remote_user_enabled"):
+        out.append("\nVPN")
+        if vpn.get("site_to_site_enabled"):
+            out.append(f"  site-to-site: {vpn.get('site_to_site_num_active', 0)} active, "
+                       f"{vpn.get('site_to_site_num_inactive', 0)} inactive")
+        if vpn.get("remote_user_enabled"):
+            out.append(f"  remote users connected: {vpn.get('remote_user_num_active', 0)}")
+
+    out.append("\nCLIENTS (online now)")
+    per_net: dict[str, int] = {}
+    for cl in c.get(c.legacy("stat/sta")):
+        net = cl.get("network") or cl.get("essid") or "?"
+        per_net[net] = per_net.get(net, 0) + 1
+    for net, n in sorted(per_net.items(), key=lambda x: -x[1]):
+        out.append(f"  {net}: {n}")
+    since_s = now_ms / 1000 - 86400
+    new = [u for u in c.get(c.legacy("stat/alluser")) if (u.get("first_seen") or 0) >= since_s]
+    if new:
+        out.append("  new in the last 24 h:")
+        out += [f"    {u.get('name') or u.get('hostname') or '?'} {u.get('mac')} "
+                f"{u.get('oui') or ''}" for u in new]
+
+    since = now_ms - 86400 * 1000
+    counts: dict[str, int] = {}
+    notable: list[tuple[int, str]] = []
+    admin_ips = _csv("MONITOR_ADMIN_IPS")
+    for page in range(30):
+        resp = c.post(c.v2("system-log/all"), {"pageNumber": page, "pageSize": 100},
+                      unwrap=False, mutating=False)
+        batch = resp.get("data", []) if isinstance(resp, dict) else []
+        for e in batch:
+            if e.get("timestamp", 0) < since:
+                continue
+            key = e.get("key") or "?"
+            counts[key] = counts.get(key, 0) + 1
+            ts = e["timestamp"]
+            when = time.strftime("%m-%d %H:%M", time.localtime(ts / 1000))
+            if key.startswith("THREAT_") or "HONEYPOT" in key:
+                notable.append((ts, f"  {when} IPS {e.get('severity')}: "
+                                    f"{_param(e, 'SRC_IP')} -> {_param(e, 'DST_IP')}"))
+            elif key == "ADMIN_ACCESS" and _param(e, "ADMIN") != os.environ.get("UNIFI_USERNAME"):
+                ip = str(_param(e, "IP") or "")
+                mark = "" if not admin_ips or ip.lower() in admin_ips else "  <-- unexpected IP"
+                notable.append((ts, f"  {when} admin login {_param(e, 'ADMIN')} from {ip}{mark}"))
+                if mark:
+                    problems.append(f"admin login from {ip}")
+        if not batch or batch[-1].get("timestamp", 0) < since \
+                or page + 1 >= resp.get("total_page_count", 0):
+            break
+    out.append("\nLAST 24 HOURS")
+    if notable:
+        out += [line for _, line in sorted(notable)]
+    blocked = sum(v for k, v in counts.items() if k.startswith("TRAFFIC_BLOCKED"))
+    threats = sum(v for k, v in counts.items() if k.startswith("THREAT_"))
+    out.append(f"  events: {sum(counts.values())}, IPS threats blocked: {threats}, "
+               f"firewall blocks logged: {blocked}")
+
+    day = time.strftime("%Y-%m-%d", time.localtime(now_ms / 1000))
+    head = ("Problems: " + "; ".join(problems)) if problems else "Everything OK."
+    subject = f"UniFi daily report {day}: " + (f"{len(problems)} problem(s)" if problems else "OK")
+    return subject, head + "\n\n" + "\n".join(out), len(problems)
+
+
 # ── delivery ────────────────────────────────────────────────────────────────
 
-def send(alerts: list[tuple[str, str, str]], dry_run: bool) -> None:
+def send(alerts: list[tuple[str, str, str]], dry_run: bool, push: bool = True,
+         email: bool = True, subject: str | None = None) -> None:
     if not alerts:
         return
     if dry_run:
         for p, t, b in alerts:
             print(f"[{p}] {t}" + (f" — {b}" if b else ""))
         return
-    ntfy = os.environ.get("NTFY_URL")
-    smtp = os.environ.get("SMTP_HOST")
-    sendmail = os.environ.get("SENDMAIL_CMD")
-    if not (ntfy or smtp or sendmail):
+    ntfy = os.environ.get("NTFY_URL") if push else None
+    smtp = os.environ.get("SMTP_HOST") if email else None
+    sendmail = os.environ.get("SENDMAIL_CMD") if email else None
+    if not (ntfy or smtp or sendmail) and push and email:
         raise ConfigError("Set NTFY_URL and/or SENDMAIL_CMD / SMTP_HOST + MAIL_TO")
     if (smtp or sendmail) and not os.environ.get("MAIL_TO"):
         raise ConfigError("Email delivery is configured but MAIL_TO is missing")
@@ -283,7 +403,8 @@ def send(alerts: list[tuple[str, str, str]], dry_run: bool) -> None:
             urllib.request.urlopen(req, timeout=15).read()
     if smtp or sendmail:
         msg = EmailMessage()
-        msg["Subject"] = alerts[0][1] if len(alerts) == 1 else f"UniFi: {len(alerts)} alerts"
+        msg["Subject"] = subject or (alerts[0][1] if len(alerts) == 1
+                                     else f"UniFi: {len(alerts)} alerts")
         msg["From"] = os.environ.get("MAIL_FROM") or os.environ.get("SMTP_USER", "")
         msg["To"] = os.environ["MAIL_TO"]
         msg.set_content("\n\n".join(f"[{p}] {t}\n{b}".rstrip() for p, t, b in alerts))
@@ -300,6 +421,7 @@ def send(alerts: list[tuple[str, str, str]], dry_run: bool) -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--test", action="store_true", help="send a test notification")
+    ap.add_argument("--report", action="store_true", help="email the daily status report")
     ap.add_argument("--dry-run", action="store_true", help="print alerts, do not send")
     args = ap.parse_args(argv)
     load_dotenv()
@@ -317,12 +439,22 @@ def main(argv: list[str] | None = None) -> int:
         except APIError as e:
             print(f"controller error: {e}", file=sys.stderr)
             return 1
-        mon = Monitor(client, state, int(time.time() * 1000))
-        mon.run()
-        if first_run:  # baseline only: do not report everything that already exists
-            mon.alerts = [("low", "UniFi monitor started",
-                           "Baseline saved; you will be notified about changes.")]
-        send(mon.alerts, args.dry_run)
+        if args.report:
+            subj, body, n = build_report(client, int(time.time() * 1000))
+            if args.dry_run:
+                print(subj + "\n\n" + body)
+            else:
+                # full report by email, one-line summary as push
+                send([("default", subj, body)], False, push=False, subject=subj)
+                send([("high" if n else "low", subj, body.split("\n\n", 1)[0])], False,
+                     email=False)
+        else:
+            mon = Monitor(client, state, int(time.time() * 1000))
+            mon.run()
+            if first_run:  # baseline only: do not report everything that already exists
+                mon.alerts = [("low", "UniFi monitor started",
+                               "Baseline saved; you will be notified about changes.")]
+            send(mon.alerts, args.dry_run)
         if not args.dry_run:  # a dry run must not consume events or change flags
             state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = state_path.with_suffix(".tmp")
